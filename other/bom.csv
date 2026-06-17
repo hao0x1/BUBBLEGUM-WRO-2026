@@ -1,0 +1,19 @@
+subsystem,component,quantity,status,what_we_still_need
+vision,LCKFB Lushan-Pi K230 CanMV board standard 1 GB layout,1,confirm,clear photo of the board name and revision
+vision,GC2093 camera module and lens exact version unknown,1,confirm,clear photo of the camera and lens marking
+control,ESP32-S3-WROOM-1-N16R8 module on a dual-USB carrier,1,confirm,clear photo of carrier name revision and COM USB labels
+orientation,GY-BNO08x purple carrier,1,rewiring,readable BNO080 or BNO085 chip marking and final continuity check
+comparison,MPU6050 breakout,1,temporary,remove after the BNO08x passes the real test unless measurements justify it
+distance,VL53L1X front-centre module,1,confirm,readable sensor or seller variant marking
+distance,VL53L4CD side module,4,installed,physical I2C enumeration test
+drive,28GP-385 12 V approximately 500 rpm 16:1 brushed planetary gearmotor,1,confirm,photo of the motor and gearbox label
+drive,IBT-2 BTS7960 brushed motor driver,1,installed,raised-wheel direction current and braking test
+drive,common back axle belt gears or differential exact parts unknown,1 set,confirm,photos and measurements of the final mechanical connection
+drive,normal vehicle wheels exact model and size unknown,4,confirm,wheel diameter width hub and final mounting photos
+steering,steering servo exact model unknown,1,confirm,photo of the servo label and measured safe pulse limits
+power,3S 11.1 V 1100 mAh 25C LiPo,1,confirm,photo of battery label and connector polarity
+power,main vehicle power switch exact model unknown,1,confirm,photo and current rating
+power,motor and K230 inline fuses exact holders and values unknown,1 set,confirm,photos and fuse values chosen from measured current
+power,ESP32 regulator exact model unknown,1,confirm,input range output voltage current rating and photo
+power,steering 5 to 6 V buck converter exact model unknown,1,confirm,input range output voltage current rating and photo
+start,four-leg normally-open momentary tactile button,1,not soldered,continuity test then GPIO4 to GND
