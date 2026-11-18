@@ -10,6 +10,22 @@ constexpr uint8_t kCornersPerLap = 4;
 constexpr uint8_t kRequiredLaps = 3;
 constexpr uint8_t kRequiredCorners = kCornersPerLap * kRequiredLaps;
 constexpr uint32_t kRecoveryObstacleSkipMs = 1000U;
+constexpr uint32_t kFirstDirectionOpticalGapMs = 120U;
+constexpr uint32_t kFirstDirectionBoundaryHoldMs = 2500U;
+constexpr uint16_t kFirstDirectionApproachSpeedPermille = 400U;
+constexpr uint16_t kFirstDirectionStartHysteresisMm = 50U;
+constexpr uint32_t kFirstDirectionPathMaximumAgeMs = 6000U;
+constexpr uint32_t kFirstDirectionPathMinimumPoweredMs = 600U;
+constexpr uint16_t kFirstDirectionPathMinimumFrontMm = 1050U;
+constexpr uint16_t kFirstDirectionBackoffTargetMm = 900U;
+constexpr uint16_t kFirstDirectionBackoffDepartureMm = 850U;
+constexpr uint16_t kFirstDirectionBackoffMaximumTravelMm = 500U;
+constexpr uint32_t kFirstDirectionBackoffMaximumPoweredMs = 1500U;
+constexpr uint32_t kFirstDirectionBackoffMaximumMs = 5000U;
+constexpr uint16_t kFirstDirectionBackoffSpeedPermille = 300U;
+constexpr uint32_t kOpenOpticalPoweredBudgetMs = 1500U;
+constexpr uint32_t kOpenOpticalUsefulEvidenceMs = 150U;
+constexpr uint16_t kOpenOpticalProbeSpeedPermille = 350U;
 constexpr float kRightAngleDegrees = 90.0F;
 // R20 deliberately adds only parking interfaces and safety gates. This guard
 // prevents a configuration edit from reaching unfinished motion code.
@@ -76,6 +92,14 @@ void DriveDirectionInterlock::reset() {
 }
 
 Controller::Controller(const Config& config) : config_(config) {
+  if (config_.obstacleRecoveryPolicy > 3U ||
+      (config_.obstacleRecoveryPolicy != 0U && !config_.obstacleAvoidanceEnabled)) {
+    configurationValid_ = false;
+  }
+  if (config_.obstacleRecoveryPolicy == 3U &&
+      config_.obstacleFallbackDirection == CourseDirection::Unknown) {
+    configurationValid_ = false;
+  }
   if (config_.clockwiseYawSign != -1 && config_.clockwiseYawSign != 1) {
     configurationValid_ = false;
     // Keep subsequent arithmetic defined even though safety will prohibit a
@@ -394,6 +418,17 @@ void Controller::reset() {
   lastCornerAtMs_ = 0;
   cornerRearmClearSinceMs_ = 0;
   cornerDetectionArmed_ = false;
+  firstDirectionStartClearanceBlocked_ = false;
+  resetFirstDirectionPathEvidence();
+  firstDirectionBackoffAttempted_ = false;
+  firstDirectionBackoffDirection_ = CourseDirection::Unknown;
+  resetOpenOpticalRecovery();
+  obstaclePolicyUpdatedAtMs_ = 0U;
+  obstaclePolicyHoldFlags_ = 0U;
+  obstaclePolicyCameraHold_ = false;
+  obstaclePolicyRangeDriving_ = false;
+  obstaclePolicyCornerRetries_ = 0U;
+  obstaclePolicyClearSamples_ = 0U;
   cornerStartedAtMs_ = 0;
   cornerReadySinceMs_ = 0;
   openingCandidateSinceMs_ = 0;
@@ -830,7 +865,11 @@ CourseDirection Controller::forwardSpaceDirectionCandidate(
   if (rightOpen && leftNumeric && !leftOpen) {
     return CourseDirection::Clockwise;
   }
-  if (!leftNumeric || !rightNumeric) return CourseDirection::Unknown;
+  if (!leftNumeric || !rightNumeric) {
+    return config_.obstacleRecoveryPolicy == 3U
+               ? config_.obstacleFallbackDirection
+               : CourseDirection::Unknown;
+  }
 
   const float margin = config_.directionOpeningWinnerMarginMm;
   if (static_cast<float>(frontLeft.rangeMm) >=
@@ -841,13 +880,18 @@ CourseDirection Controller::forwardSpaceDirectionCandidate(
       static_cast<float>(frontLeft.rangeMm) + margin) {
     return CourseDirection::Clockwise;
   }
+  if (config_.obstacleRecoveryPolicy == 3U) {
+    return config_.obstacleFallbackDirection;
+  }
   return CourseDirection::Unknown;
 }
 
 bool Controller::sideReadingIsOpen(const RangeReading& reading,
                                    uint32_t nowMs) const {
   return reading.online && reading.i2cStatus == 0U && !reading.valid &&
-         strongOpticalNoTargetStatus(reading.rangeStatus) &&
+         (config_.obstacleRecoveryPolicy == 3U
+              ? opticalNoTargetStatus(reading.rangeStatus)
+              : strongOpticalNoTargetStatus(reading.rangeStatus)) &&
          readingFresh(nowMs, reading.updatedAtMs, config_.sensorStaleMs);
 }
 
@@ -913,6 +957,27 @@ uint32_t Controller::evaluateSafety(const Inputs& inputs,
 
   if (!configurationValid_) faults |= FaultConfiguration;
 
+  // READY must include the same first-turn clearance required after Start.
+  // This is a recoverable placement/readiness condition, not a latched run
+  // failure. Once blocked, require another 50 mm before arming so boundary
+  // jitter cannot repeatedly arm and disarm the physical start button.
+  if (config_.firstDirectionApproachHoldEnabled &&
+      !config_.obstacleAvoidanceEnabled &&
+      !config_.sideSensorPairsAreParallel && !decision_.startLatched) {
+    if (frontReadingUsable(inputs.front, inputs.nowMs)) {
+      if (inputs.front.rangeMm <= config_.directionProbeAbortFrontMm) {
+        firstDirectionStartClearanceBlocked_ = true;
+      } else if (static_cast<uint32_t>(inputs.front.rangeMm) >
+                 static_cast<uint32_t>(config_.directionProbeAbortFrontMm) +
+                     kFirstDirectionStartHysteresisMm) {
+        firstDirectionStartClearanceBlocked_ = false;
+      }
+    }
+    if (firstDirectionStartClearanceBlocked_) {
+      faults |= FaultDirectionAmbiguous;
+    }
+  }
+
   if (!inputs.imu.online || !inputs.imu.valid ||
       !isfinite(inputs.imu.yawDegrees)) {
     faults |= FaultImuUnavailable;
@@ -977,12 +1042,19 @@ uint32_t Controller::evaluateSafety(const Inputs& inputs,
       strongFreshFrontNoTarget &&
       decision_.state == RunState::DirectionProbe &&
       (config_.obstacleAvoidanceEnabled
-           ? straightSideGeometryUsable(inputs, wall)
+           ? (config_.obstacleRecoveryPolicy == 3U && healthyImuGuidance) ||
+                 straightSideGeometryUsable(inputs, wall)
            : healthyImuGuidance && anyNumericSideReadingUsable(inputs));
   const bool guidedOpenCorner =
-      strongFreshFrontNoTarget && !config_.obstacleAvoidanceEnabled &&
+      strongFreshFrontNoTarget &&
+      (!config_.obstacleAvoidanceEnabled ||
+       config_.obstacleRecoveryPolicy == 3U ||
+       (config_.obstacleRecoveryPolicy > 0U &&
+        (visionFreshAndValid(inputs) ||
+         (config_.obstacleRecoveryPolicy == 2U &&
+          obstacleMeasuredRouteReady(inputs, 350U, true))))) &&
       decision_.state == RunState::Cornering && healthyImuGuidance &&
-      (wall.outerWallUsable ||
+      (config_.obstacleRecoveryPolicy == 3U || wall.outerWallUsable ||
        (!config_.sideSensorPairsAreParallel &&
         anyLocalSideReadingUsable(inputs)));
   if (!freshFrontOpticalNoTarget || !movingState ||
@@ -1097,8 +1169,12 @@ uint32_t Controller::evaluateSafety(const Inputs& inputs,
       config_.guardedObstaclePassEnabled &&
       config_.obstacleAvoidanceEnabled &&
       !config_.sideSensorPairsAreParallel && !sideElectricalFault &&
-      healthyImuGuidance && visionFreshAndValid(inputs) &&
-      anyLocalSideReadingUsable(inputs) &&
+      healthyImuGuidance &&
+      (config_.obstacleRecoveryPolicy == 3U ||
+       ((visionFreshAndValid(inputs) ||
+         (config_.obstacleRecoveryPolicy == 2U &&
+          obstacleMeasuredRouteReady(inputs, 350U, true))) &&
+        anyLocalSideReadingUsable(inputs))) &&
       ((frontReadingUsable(inputs.front, inputs.nowMs) &&
         (inputs.front.rangeMm > config_.frontEmergencyStopMm ||
          config_.wallRecoveryEnabled)) ||
@@ -1228,6 +1304,16 @@ uint32_t Controller::evaluateSafety(const Inputs& inputs,
 }
 
 void Controller::startRun(const Inputs& inputs) {
+  obstaclePolicyUpdatedAtMs_ = inputs.nowMs;
+  obstaclePolicyHoldFlags_ = 0U;
+  obstaclePolicyCameraHold_ = false;
+  obstaclePolicyRangeDriving_ = false;
+  obstaclePolicyCornerRetries_ = 0U;
+  obstaclePolicyClearSamples_ = 0U;
+  resetOpenOpticalRecovery();
+  resetFirstDirectionPathEvidence();
+  firstDirectionBackoffAttempted_ = false;
+  firstDirectionBackoffDirection_ = CourseDirection::Unknown;
   decision_.startLatched = true;
   decision_.state =
       config_.parkingEnabled ? RunState::Parking : RunState::DirectionProbe;
@@ -1370,9 +1456,539 @@ bool Controller::expectedOpeningPresent(
   return false;
 }
 
+void Controller::resetObstacleHoldProofs() {
+  cornerReadySinceMs_ = 0U;
+  finishReadySinceMs_ = 0U;
+  cornerRearmClearSinceMs_ = 0U;
+  openingCandidate_ = CourseDirection::Unknown;
+  openingCandidateDistinctSamples_ = 0U;
+  openingCandidateSinceMs_ = 0U;
+  obstacleAbsentSinceMs_ = 0U;
+  obstacleClearSinceMs_ = 0U;
+  obstacleBodyClearStartedAtMs_ = 0U;
+  obstacleBodyClearActive_ = false;
+  obstacleSuccessorCandidateActive_ = false;
+  obstacleSuccessorRollover_ = false;
+  obstacleSuccessorCandidateSampleAtMs_ = 0U;
+  obstacleCenteredEscapeRecoveryCandidateActive_ = false;
+  obstacleCenteredEscapeHeadingCandidateActive_ = false;
+}
+
+void Controller::updateObstacleHoldTime(const Inputs& inputs) {
+  if (config_.obstacleRecoveryPolicy == 0U || !config_.obstacleAvoidanceEnabled) return;
+  const uint32_t elapsed = inputs.nowMs - obstaclePolicyUpdatedAtMs_;
+  obstaclePolicyUpdatedAtMs_ = inputs.nowMs;
+  const bool held = obstaclePolicyHoldFlags_ != 0U || obstaclePolicyCameraHold_ ||
+      decision_.faultFlags != FaultNone || visionLossActive_ ||
+      sideElectricalLossActive_ || wallRecoveryHealthHoldActive_;
+  if (!decision_.startLatched || !held || !inputs.driveFeedbackAvailable ||
+      inputs.appliedDrivePermille != 0U || decision_.speedPermille != 0U) return;
+  if (decision_.state == RunState::DirectionProbe) directionProbeTimerStartedAtMs_ += elapsed;
+  else if (decision_.state == RunState::Cornering) cornerStartedAtMs_ += elapsed;
+  else if (decision_.state == RunState::FinishDelay) finishEnteredAtMs_ += elapsed;
+  if (committedObstacle_ != ObstacleTarget::None) obstacleCommittedAtMs_ += elapsed;
+  if (obstacleRecenterStartOffsetMm_ != 0) obstacleRecenterStartedAtMs_ += elapsed;
+  // Existing recovery owns its clock; never shift it twice or move the
+  // absolute runStartedAtMs_ competition deadline.
+  resetObstacleHoldProofs();
+}
+
+bool Controller::obstacleMeasuredRouteReady(const Inputs& inputs,
+                                           uint16_t minimumFrontMm,
+                                           bool requireNumericLeading) const {
+  if (!frontReadingUsable(inputs.front, inputs.nowMs) ||
+      inputs.front.rangeMm <= minimumFrontMm || !inputs.imu.online ||
+      !inputs.imu.valid || !isfinite(inputs.imu.yawDegrees) ||
+      inputs.imu.accuracy < config_.minimumRunImuAccuracy ||
+      !readingFresh(inputs.nowMs, inputs.imu.updatedAtMs, config_.sensorStaleMs)) return false;
+  for (uint8_t i = 0U; i < SideSensorCount; ++i) {
+    if (!inputs.sides[i].online || inputs.sides[i].i2cStatus != 0U ||
+        !readingFresh(inputs.nowMs, inputs.sides[i].updatedAtMs,
+                      config_.sensorStaleMs)) return false;
+  }
+  bool numericLeading = false;
+  const uint8_t leading[] = {FrontLeft, FrontRight};
+  for (uint8_t index : leading) {
+    const RangeReading& ray = inputs.sides[index];
+    const bool numeric = sideReadingUsable(ray, inputs.nowMs) && ray.rangeMm > 200U;
+    numericLeading = numericLeading || numeric;
+    if (!numeric && !sideReadingIsOpen(ray, inputs.nowMs)) return false;
+  }
+  const uint8_t rear[] = {BackLeft, BackRight};
+  for (uint8_t index : rear) {
+    const RangeReading& ray = inputs.sides[index];
+    if (!((sideReadingUsable(ray, inputs.nowMs) && ray.rangeMm > 200U) ||
+          sideReadingIsOpen(ray, inputs.nowMs))) return false;
+  }
+  return !requireNumericLeading || numericLeading;
+}
+
+bool Controller::handleObstaclePolicy(const Inputs& inputs) {
+  if (config_.obstacleRecoveryPolicy == 0U || !config_.obstacleAvoidanceEnabled) return false;
+  const bool wasPending = obstaclePolicyHoldFlags_ != 0U || obstaclePolicyCameraHold_;
+  if (config_.obstacleRecoveryPolicy != 3U &&
+      decision_.state == RunState::FinishDelay && inputs.front.online &&
+      inputs.front.i2cStatus == 0U &&
+      readingFresh(inputs.nowMs, inputs.front.updatedAtMs, config_.sensorStaleMs) &&
+      !frontReadingUsable(inputs.front, inputs.nowMs) &&
+      opticalNoTargetStatus(inputs.front.rangeStatus)) {
+    // Missing finish geometry is not evidence of an extra corner. Preserve
+    // the completed lap count and wait stopped for a new measured finish.
+    obstaclePolicyHoldFlags_ |= FaultFrontTofUnavailable;
+  }
+  const bool cameraMissing = config_.obstacleRecoveryPolicy == 2U &&
+      !visionFreshAndValid(inputs);
+  if (!cameraMissing) obstaclePolicyRangeDriving_ = false;
+  if (cameraMissing && !obstaclePolicyRangeDriving_) obstaclePolicyCameraHold_ = true;
+  if (cameraMissing && !obstacleMeasuredRouteReady(inputs, 350U, true)) {
+    obstaclePolicyCameraHold_ = true;
+    obstaclePolicyRangeDriving_ = false;
+  }
+  if (cameraMissing && committedObstacle_ != ObstacleTarget::None) {
+    obstaclePolicyCameraHold_ = true;
+  }
+  const bool pending = obstaclePolicyHoldFlags_ != 0U || obstaclePolicyCameraHold_;
+  if (pending && !wasPending) obstaclePolicyClearSamples_ = 0U;
+  if (!pending) return false;
+  const bool directionHold = (obstaclePolicyHoldFlags_ &
+      (FaultDirectionAmbiguous | FaultDirectionTimeout)) != 0U;
+  const bool cornerHold = (obstaclePolicyHoldFlags_ & FaultCornerTimeout) != 0U;
+  const uint16_t minimumFront = directionHold ? config_.directionProbeAbortFrontMm
+      : decision_.state == RunState::FinishDelay ? config_.frontCornerTriggerMm : 350U;
+  bool ready = obstacleMeasuredRouteReady(inputs, minimumFront, cameraMissing) &&
+      (!config_.requireVisionForMotion || visionFreshAndValid(inputs));
+  if (directionHold) ready = ready &&
+      forwardSpaceDirectionCandidate(inputs) != CourseDirection::Unknown;
+  if (cornerHold) {
+    const bool geometryImproved =
+        inputs.front.rangeMm >= static_cast<uint32_t>(obstaclePolicyHoldFrontMm_) + 150U ||
+        absoluteValue(unwrappedHeadingDegrees_ - obstaclePolicyHoldHeadingDegrees_) >= 5.0F;
+    const bool boundedProgressRetry = config_.obstacleRecoveryPolicy == 2U &&
+        inputs.front.rangeMm > 650U;
+    ready = ready && (geometryImproved || boundedProgressRetry) &&
+        obstaclePolicyCornerRetries_ < 1U;
+  }
+  if (!ready) obstaclePolicyClearSamples_ = 0U;
+  else if (obstaclePolicyClearSamples_ == 0U ||
+           (inputs.front.updatedAtMs != obstaclePolicyLastFrontAtMs_ &&
+            inputs.sides[FrontLeft].updatedAtMs != obstaclePolicyLastLeftAtMs_ &&
+            inputs.sides[FrontRight].updatedAtMs != obstaclePolicyLastRightAtMs_)) {
+    if (obstaclePolicyClearSamples_ == 0U) obstaclePolicyEvidenceSinceMs_ = inputs.nowMs;
+    obstaclePolicyLastFrontAtMs_ = inputs.front.updatedAtMs;
+    obstaclePolicyLastLeftAtMs_ = inputs.sides[FrontLeft].updatedAtMs;
+    obstaclePolicyLastRightAtMs_ = inputs.sides[FrontRight].updatedAtMs;
+    obstaclePolicyEvidenceAtMs_ = inputs.nowMs;
+    if (obstaclePolicyClearSamples_ < 255U) ++obstaclePolicyClearSamples_;
+  }
+  if (ready && obstaclePolicyClearSamples_ >= 3U &&
+      elapsedAtLeast(obstaclePolicyEvidenceAtMs_, obstaclePolicyEvidenceSinceMs_, 150U)) {
+    if (cameraMissing) {
+      const ObstacleTarget skipped = committedObstacle_;
+      clearCommittedObstacle(inputs.nowMs, false);
+      if (skipped != ObstacleTarget::None) {
+        recoverySkippedObstacle_ = skipped;
+        recoverySkippedObstacleAtMs_ = inputs.nowMs;
+      }
+      decision_.obstacle = ObstacleTarget::None;
+      decision_.targetLateralOffsetMm = 0;
+    }
+    if (directionHold) {
+      directionProbeTimerStartedAtMs_ = inputs.nowMs;
+      directionDecisionHoldActive_ = false;
+    }
+    if (cornerHold) {
+      ++obstaclePolicyCornerRetries_;
+      cornerStartedAtMs_ = inputs.nowMs;
+    }
+    if ((obstaclePolicyHoldFlags_ & FaultObstaclePassTimeout) != 0U) {
+      obstacleCommittedAtMs_ = inputs.nowMs;
+    }
+    obstaclePolicyHoldFlags_ = 0U;
+    obstaclePolicyCameraHold_ = false;
+    obstaclePolicyRangeDriving_ = cameraMissing;
+    obstaclePolicyClearSamples_ = 0U;
+    decision_.faultFlags = FaultNone;
+    return false;
+  }
+  decision_.faultFlags = obstaclePolicyHoldFlags_ != 0U
+      ? obstaclePolicyHoldFlags_ : uint32_t(FaultVisionUnavailable);
+  decision_.motionAllowed = false;
+  decision_.speedPermille = 0U;
+  decision_.steeringPermille = 0;
+  decision_.driveDirection = driveDirectionInterlock_.update(
+      DriveDirection::Stopped, inputs.nowMs, config_.parkingReverseNeutralMs);
+  decision_.unwrappedHeadingDegrees = unwrappedHeadingDegrees_;
+  lastCommandedSpeedPermille_ = 0U;
+  lastSpeedCommandAtMs_ = inputs.nowMs;
+  resetObstacleHoldProofs();
+  return true;
+}
+
+void Controller::resetOpenOpticalRecovery() {
+  openOpticalHoldActive_ = false;
+  openOpticalProbeAllowed_ = false;
+  openOpticalNearFront_ = false;
+  openOpticalUpdatedAtMs_ = 0U;
+  openOpticalPoweredMs_ = 0U;
+  openOpticalUsefulSamples_ = 0U;
+}
+
+void Controller::updateOpenOpticalRecoveryTime(const Inputs& inputs) {
+  if (!config_.openOpticalRecoveryEnabled || config_.obstacleAvoidanceEnabled) return;
+  const uint32_t elapsed = inputs.nowMs - openOpticalUpdatedAtMs_;
+  openOpticalUpdatedAtMs_ = inputs.nowMs;
+  const bool powered = openOpticalProbeAllowed_ && inputs.driveFeedbackAvailable &&
+      inputs.appliedDrivePermille > 0U && decision_.speedPermille > 0U &&
+      decision_.driveDirection == DriveDirection::Forward;
+  // Feedback describes the output applied during the preceding command
+  // interval. Count each authorized blind interval, including isolated ones
+  // between numeric frames; those frames cannot replenish the budget until
+  // the independent three-acquisition recovery proof completes.
+  if (powered) openOpticalPoweredMs_ += elapsed;
+  const bool stoppedHold = openOpticalHoldActive_ ||
+      (decision_.state == RunState::DirectionProbe &&
+       decision_.faultFlags == FaultDirectionAmbiguous);
+  if (stoppedHold && inputs.driveFeedbackAvailable &&
+      inputs.appliedDrivePermille == 0U && decision_.speedPermille == 0U) {
+    if (decision_.state == RunState::DirectionProbe) {
+      directionProbeTimerStartedAtMs_ += elapsed;
+    } else if (decision_.state == RunState::Cornering) {
+      cornerStartedAtMs_ += elapsed;
+    }
+    // Stopped optical time can neither complete a corner nor earn finish proof.
+    cornerReadySinceMs_ = 0U;
+    finishReadySinceMs_ = 0U;
+  }
+}
+
+bool Controller::handleOpenOpticalRecovery(const Inputs& inputs,
+                                          const WallGuidance& wall) {
+  openOpticalProbeAllowed_ = false;
+  if (!config_.openOpticalRecoveryEnabled || config_.obstacleAvoidanceEnabled ||
+      firstDirectionBackoffDirection_ != CourseDirection::Unknown) return false;
+  const bool numericFront = frontReadingUsable(inputs.front, inputs.nowMs);
+  if (numericFront) openOpticalNearFront_ =
+      inputs.front.rangeMm <= config_.directionProbeAbortFrontMm;
+  const bool strongFront = sideReadingIsOpen(inputs.front, inputs.nowMs);
+  const bool guided = strongFront && !openOpticalNearFront_ &&
+      ((decision_.state == RunState::DirectionProbe &&
+        anyNumericSideReadingUsable(inputs)) ||
+       (decision_.state == RunState::Cornering &&
+        (wall.outerWallUsable || anyLocalSideReadingUsable(inputs))));
+  const bool useful = numericFront || guided;
+  uint8_t evidenceSource = numericFront ? 0U : 255U;
+  uint32_t evidenceAtMs = inputs.front.updatedAtMs;
+  if (!numericFront && guided) {
+    for (uint8_t i = 0U; i < SideSensorCount; ++i) {
+      if (sideReadingUsable(inputs.sides[i], inputs.nowMs)) {
+        evidenceSource = static_cast<uint8_t>(i + 1U);
+        evidenceAtMs = inputs.sides[i].updatedAtMs;
+        break;
+      }
+    }
+  }
+  if (evidenceSource != openOpticalEvidenceSource_) {
+    openOpticalUsefulSamples_ = 0U;
+    openOpticalEvidenceSource_ = evidenceSource;
+  }
+  if (!useful) {
+    openOpticalUsefulSamples_ = 0U;
+  } else if (openOpticalUsefulSamples_ == 0U ||
+             evidenceAtMs != openOpticalLastUsefulAtMs_) {
+    if (openOpticalUsefulSamples_ == 0U) openOpticalUsefulSinceMs_ = inputs.nowMs;
+    openOpticalLastUsefulAtMs_ = evidenceAtMs;
+    openOpticalUsefulEvidenceAtMs_ = inputs.nowMs;
+    if (openOpticalUsefulSamples_ < 255U) ++openOpticalUsefulSamples_;
+  }
+  const bool usefulConfirmed = useful && openOpticalUsefulSamples_ >= 3U &&
+      elapsedAtLeast(openOpticalUsefulEvidenceAtMs_, openOpticalUsefulSinceMs_,
+                     kOpenOpticalUsefulEvidenceMs);
+  if (usefulConfirmed) {
+    openOpticalPoweredMs_ = 0U;
+    openOpticalHoldActive_ = false;
+  }
+  if (useful && !openOpticalHoldActive_) return false;
+  bool allSidesObserved = true;
+  for (uint8_t i = 0U; i < SideSensorCount; ++i) {
+    allSidesObserved = allSidesObserved &&
+        (sideReadingUsable(inputs.sides[i], inputs.nowMs) ||
+         sideReadingIsOpen(inputs.sides[i], inputs.nowMs));
+  }
+  const bool mayProbe = !openOpticalHoldActive_ && !openOpticalNearFront_ &&
+      strongFront && allSidesObserved && inputs.driveFeedbackAvailable &&
+      inputs.imu.accuracy >= config_.minimumRunImuAccuracy &&
+      openOpticalPoweredMs_ < kOpenOpticalPoweredBudgetMs;
+  if (mayProbe) {
+    openOpticalProbeAllowed_ = true;
+    return false;
+  }
+  openOpticalHoldActive_ = true;
+  if (decision_.state == RunState::Cornering) {
+    const float sign = decision_.direction == CourseDirection::Clockwise
+        ? static_cast<float>(config_.clockwiseYawSign)
+        : -static_cast<float>(config_.clockwiseYawSign);
+    const float progress = (unwrappedHeadingDegrees_ - cornerStartHeadingDegrees_) * sign;
+    if (progress > config_.cornerMaximumDegrees ||
+        progress < -config_.maxReverseProgressDegrees) {
+      latchFault(progress > config_.cornerMaximumDegrees
+                     ? FaultCornerOvershoot : FaultWrongWay);
+      return true;
+    }
+  }
+  decision_.faultFlags = FaultFrontTofUnavailable;
+  decision_.motionAllowed = false;
+  decision_.speedPermille = 0U;
+  decision_.steeringPermille = 0;
+  decision_.driveDirection = driveDirectionInterlock_.update(
+      DriveDirection::Stopped, inputs.nowMs, config_.parkingReverseNeutralMs);
+  decision_.unwrappedHeadingDegrees = unwrappedHeadingDegrees_;
+  cornerReadySinceMs_ = 0U;
+  finishReadySinceMs_ = 0U;
+  lastCommandedSpeedPermille_ = 0U;
+  lastSpeedCommandAtMs_ = inputs.nowMs;
+  return true;
+}
+
+void Controller::resetFirstDirectionPathEvidence() {
+  firstDirectionPathAnchorValid_ = false;
+  firstDirectionPathWasPowered_ = false;
+  firstDirectionPathPoweredMs_ = 0U;
+  firstDirectionPathMaximumFrontMm_ = 0U;
+}
+
+void Controller::updateFirstDirectionPathEvidence(const Inputs& inputs) {
+  const uint32_t elapsed = inputs.nowMs - firstDirectionPathUpdatedAtMs_;
+  firstDirectionPathUpdatedAtMs_ = inputs.nowMs;
+  const bool numericFront = frontReadingUsable(inputs.front, inputs.nowMs);
+  const bool observedFront = inputs.front.online && inputs.front.i2cStatus == 0U &&
+      readingFresh(inputs.nowMs, inputs.front.updatedAtMs, config_.sensorStaleMs) &&
+      (numericFront || (!inputs.front.valid &&
+                       opticalNoTargetStatus(inputs.front.rangeStatus)));
+  bool healthyPath = config_.firstDirectionApproachHoldEnabled &&
+      !config_.obstacleAvoidanceEnabled && !config_.sideSensorPairsAreParallel &&
+      decision_.state == RunState::DirectionProbe &&
+      decision_.direction == CourseDirection::Unknown &&
+      !firstDirectionBackoffAttempted_ && inputs.driveFeedbackAvailable &&
+      observedFront &&
+      absoluteValue(unwrappedHeadingDegrees_ - runStartHeadingDegrees_) <= 8.0F;
+  for (uint8_t i = 0U; i < SideSensorCount; ++i) {
+    healthyPath = healthyPath && inputs.sides[i].online &&
+        inputs.sides[i].i2cStatus == 0U &&
+        readingFresh(inputs.nowMs, inputs.sides[i].updatedAtMs,
+                     config_.sensorStaleMs);
+  }
+  if (!healthyPath) {
+    resetFirstDirectionPathEvidence();
+    return;
+  }
+  const uint32_t pathMaximumAgeMs = config_.openOpticalRecoveryEnabled
+      ? 15000U : kFirstDirectionPathMaximumAgeMs;
+  if (firstDirectionPathAnchorValid_ &&
+      inputs.nowMs - firstDirectionPathAnchorAtMs_ >
+          pathMaximumAgeMs) {
+    resetFirstDirectionPathEvidence();
+  }
+  if (!firstDirectionPathAnchorValid_ &&
+      numericFront &&
+      inputs.front.rangeMm >= kFirstDirectionPathMinimumFrontMm) {
+    // A post-Start observation during servo settling is a valid path anchor;
+    // only subsequent actual powered travel contributes the required 600 ms.
+    firstDirectionPathAnchorValid_ = true;
+    firstDirectionPathAnchorAtMs_ = inputs.nowMs;
+    firstDirectionPathMaximumFrontMm_ = inputs.front.rangeMm;
+    firstDirectionPathPoweredMs_ = 0U;
+  }
+  // A brief, electrically healthy optical gap does not erase the anchored
+  // straight path. It contributes no powered history, and the next numeric
+  // sample must begin a new pair of observed powered intervals.
+  const bool powered = numericFront && inputs.appliedDrivePermille > 0U &&
+      decision_.driveDirection == DriveDirection::Forward &&
+      decision_.speedPermille > 0U;
+  if (firstDirectionPathAnchorValid_ && powered &&
+      firstDirectionPathWasPowered_ && elapsed <= config_.sensorStaleMs) {
+    firstDirectionPathPoweredMs_ += elapsed;
+  }
+  firstDirectionPathWasPowered_ = powered;
+}
+
+bool Controller::handleFirstDirectionBackoff(const Inputs& inputs,
+                                            CourseDirection candidate,
+                                            bool directionConfirmed) {
+  if (!config_.firstDirectionApproachHoldEnabled ||
+      config_.obstacleAvoidanceEnabled || config_.sideSensorPairsAreParallel ||
+      decision_.state != RunState::DirectionProbe ||
+      decision_.direction != CourseDirection::Unknown ||
+      decision_.cornerCount != 0U) return false;
+  const bool active = firstDirectionBackoffDirection_ != CourseDirection::Unknown;
+  if (!active) {
+    if (firstDirectionBackoffAttempted_ || !directionConfirmed ||
+        candidate == CourseDirection::Unknown ||
+        !frontReadingUsable(inputs.front, inputs.nowMs) ||
+        inputs.front.rangeMm > config_.directionProbeAbortFrontMm ||
+        !inputs.driveFeedbackAvailable || !firstDirectionPathAnchorValid_ ||
+        firstDirectionPathPoweredMs_ < kFirstDirectionPathMinimumPoweredMs ||
+        inputs.nowMs - firstDirectionPathAnchorAtMs_ >
+            (config_.openOpticalRecoveryEnabled
+                 ? 15000U : kFirstDirectionPathMaximumAgeMs) ||
+        firstDirectionPathMaximumFrontMm_ < kFirstDirectionBackoffTargetMm) {
+      return false;
+    }
+    firstDirectionBackoffAttempted_ = true;
+    firstDirectionBackoffDirection_ = candidate;
+    firstDirectionBackoffStartedAtMs_ = inputs.nowMs;
+    firstDirectionBackoffUpdatedAtMs_ = inputs.nowMs;
+    firstDirectionBackoffPoweredMs_ = 0U;
+    firstDirectionBackoffNeutralActive_ = false;
+    firstDirectionBackoffStartFrontMm_ = inputs.front.rangeMm;
+    firstDirectionBackoffHeadingDegrees_ = unwrappedHeadingDegrees_;
+    firstDirectionBackoffClearSamples_ = 0U;
+    decision_.wallRecoveryPhase = 1U;
+    decision_.wallRecoveryHazards = 1U;
+    decision_.wallRecoveryExitReason = 0U;
+  }
+  const uint32_t elapsed = inputs.nowMs - firstDirectionBackoffUpdatedAtMs_;
+  firstDirectionBackoffUpdatedAtMs_ = inputs.nowMs;
+  if (decision_.wallRecoveryPhase == 2U && inputs.driveFeedbackAvailable &&
+      inputs.appliedDrivePermille > 0U &&
+      decision_.driveDirection == DriveDirection::Reverse) {
+    firstDirectionBackoffPoweredMs_ += elapsed;
+  }
+  const auto fail = [&](uint32_t fault) {
+    firstDirectionBackoffDirection_ = CourseDirection::Unknown;
+    decision_.wallRecoveryPhase = 0U;
+    latchFault(fault);
+    return true;
+  };
+  bool observed = inputs.driveFeedbackAvailable &&
+      frontReadingUsable(inputs.front, inputs.nowMs) &&
+      inputs.imu.online && inputs.imu.valid &&
+      readingFresh(inputs.nowMs, inputs.imu.updatedAtMs, config_.sensorStaleMs) &&
+      inputs.imu.accuracy >= config_.minimumRunImuAccuracy;
+  for (uint8_t i = 0U; i < SideSensorCount; ++i) {
+    observed = observed &&
+        (sideReadingUsable(inputs.sides[i], inputs.nowMs) ||
+         sideReadingIsOpen(inputs.sides[i], inputs.nowMs));
+  }
+  if (!observed) return fail(FaultSideGeometryUnavailable);
+  if (absoluteValue(unwrappedHeadingDegrees_ -
+                    firstDirectionBackoffHeadingDegrees_) > 8.0F ||
+      absoluteValue(unwrappedHeadingDegrees_ - runStartHeadingDegrees_) > 8.0F ||
+      (candidate != CourseDirection::Unknown &&
+       candidate != firstDirectionBackoffDirection_)) {
+    return fail(FaultDirectionAmbiguous);
+  }
+  if (rearRayAtOrBelow(inputs, 350U)) return fail(FaultFrontTooClose);
+  if (inputs.nowMs - firstDirectionBackoffStartedAtMs_ >=
+          kFirstDirectionBackoffMaximumMs ||
+      firstDirectionBackoffPoweredMs_ >=
+          kFirstDirectionBackoffMaximumPoweredMs ||
+      inputs.front.rangeMm >
+          static_cast<uint32_t>(firstDirectionBackoffStartFrontMm_) +
+              kFirstDirectionBackoffMaximumTravelMm) {
+    return fail(FaultDirectionAmbiguous);
+  }
+
+  const bool actualNeutral = inputs.appliedDrivePermille == 0U &&
+      decision_.speedPermille == 0U &&
+      decision_.driveDirection == DriveDirection::Stopped;
+  if (decision_.wallRecoveryPhase != 2U) {
+    if (!actualNeutral) firstDirectionBackoffNeutralActive_ = false;
+    else if (!firstDirectionBackoffNeutralActive_) {
+      firstDirectionBackoffNeutralActive_ = true;
+      firstDirectionBackoffNeutralSinceMs_ = inputs.nowMs;
+    }
+  }
+  if (decision_.wallRecoveryPhase == 1U &&
+      firstDirectionBackoffNeutralActive_ &&
+      elapsedAtLeast(inputs.nowMs, firstDirectionBackoffNeutralSinceMs_,
+                     config_.parkingReverseNeutralMs)) {
+    decision_.wallRecoveryPhase = 2U;
+    firstDirectionBackoffNeutralActive_ = false;
+  }
+  if (decision_.wallRecoveryPhase == 2U &&
+      inputs.front.rangeMm >= kFirstDirectionBackoffTargetMm) {
+    decision_.wallRecoveryPhase = 3U;
+    decision_.wallRecoveryExitReason = 1U;
+    firstDirectionBackoffNeutralActive_ = false;
+    firstDirectionBackoffClearSamples_ = 0U;
+  }
+  if (decision_.wallRecoveryPhase == 3U) {
+    if (inputs.front.rangeMm < kFirstDirectionBackoffDepartureMm) {
+      firstDirectionBackoffClearSamples_ = 0U;
+    } else if (firstDirectionBackoffClearSamples_ == 0U ||
+               inputs.front.updatedAtMs != firstDirectionBackoffLastFrontAtMs_) {
+      firstDirectionBackoffLastFrontAtMs_ = inputs.front.updatedAtMs;
+      if (firstDirectionBackoffClearSamples_ < 255U) {
+        ++firstDirectionBackoffClearSamples_;
+      }
+    }
+    if (firstDirectionBackoffNeutralActive_ &&
+        elapsedAtLeast(inputs.nowMs, firstDirectionBackoffNeutralSinceMs_,
+                       config_.parkingReverseNeutralMs) &&
+        firstDirectionBackoffClearSamples_ >= 2U) {
+      const CourseDirection recoveredDirection = firstDirectionBackoffDirection_;
+      firstDirectionBackoffDirection_ = CourseDirection::Unknown;
+      decision_.wallRecoveryPhase = 0U;
+      directionDecisionHoldActive_ = false;
+      directionDecisionHoldSinceMs_ = 0U;
+      openingConfirmed(CourseDirection::Unknown, inputs);
+      decision_.direction = recoveredDirection;
+      enterCorner(inputs);
+      return true;
+    }
+  }
+  const DriveDirection requested = decision_.wallRecoveryPhase == 2U
+      ? DriveDirection::Reverse : DriveDirection::Stopped;
+  decision_.driveDirection = driveDirectionInterlock_.update(
+      requested, inputs.nowMs, config_.parkingReverseNeutralMs);
+  decision_.speedPermille = decision_.driveDirection == DriveDirection::Reverse
+      ? kFirstDirectionBackoffSpeedPermille : 0U;
+  decision_.steeringPermille = 0;
+  decision_.motionAllowed = decision_.speedPermille > 0U;
+  decision_.faultFlags = FaultNone;
+  lastCommandedSpeedPermille_ = 0U;
+  lastSpeedCommandAtMs_ = inputs.nowMs;
+  return true;
+}
+
 bool Controller::openingConfirmed(CourseDirection candidate,
                                   const Inputs& inputs) {
+  const bool openFirstDirectionHold =
+      config_.firstDirectionApproachHoldEnabled &&
+      !config_.obstacleAvoidanceEnabled &&
+      !config_.sideSensorPairsAreParallel &&
+      decision_.state == RunState::DirectionProbe;
   if (candidate == CourseDirection::Unknown) {
+    const RangeReading& left = inputs.sides[FrontLeft];
+    const RangeReading& right = inputs.sides[FrontRight];
+    const bool frontRaysFresh =
+        left.online && left.i2cStatus == 0U &&
+        readingFresh(inputs.nowMs, left.updatedAtMs, config_.sensorStaleMs) &&
+        right.online && right.i2cStatus == 0U &&
+        readingFresh(inputs.nowMs, right.updatedAtMs, config_.sensorStaleMs);
+    const bool frontOpticalGap =
+        inputs.front.online && inputs.front.i2cStatus == 0U &&
+        readingFresh(inputs.nowMs, inputs.front.updatedAtMs,
+                     config_.sensorStaleMs) &&
+        !frontReadingUsable(inputs.front, inputs.nowMs) &&
+        opticalNoTargetStatus(inputs.front.rangeStatus);
+    const bool opticalGap =
+        (!left.valid && opticalNoTargetStatus(left.rangeStatus)) ||
+        (!right.valid && opticalNoTargetStatus(right.rangeStatus)) ||
+        frontOpticalGap;
+    if (openFirstDirectionHold && frontRaysFresh && opticalGap &&
+        openingCandidate_ != CourseDirection::Unknown &&
+        inputs.nowMs - openingCandidateLastEvidenceAtMs_ <=
+            kFirstDirectionOpticalGapMs &&
+        ((frontReadingUsable(inputs.front, inputs.nowMs) &&
+          inputs.front.rangeMm <= config_.directionProbeFrontMaximumMm) ||
+         frontOpticalGap)) {
+      // Missing optical evidence may keep the motor neutral, but cannot add
+      // samples, extend the evidence time, or authorize a turn. This includes
+      // both rays returning 2/4: loss of the local numeric wall is inconclusive.
+      // A numeric tie, opposite candidate, stale sample, or longer gap resets.
+      return false;
+    }
     openingCandidate_ = CourseDirection::Unknown;
     openingCandidateSinceMs_ = 0;
     openingCandidateLastLeftSampleAtMs_ = 0;
@@ -1382,7 +1998,10 @@ bool Controller::openingConfirmed(CourseDirection candidate,
     openingCandidateDistinctSamples_ = 0;
     return false;
   }
-  if (candidate != openingCandidate_) {
+  if (candidate != openingCandidate_ ||
+      (openFirstDirectionHold &&
+       inputs.nowMs - openingCandidateLastEvidenceAtMs_ >
+           kFirstDirectionOpticalGapMs)) {
     openingCandidate_ = candidate;
     openingCandidateSinceMs_ = inputs.nowMs;
     openingCandidateLastLeftSampleAtMs_ =
@@ -1489,6 +2108,13 @@ void Controller::updateCorner(const Inputs& inputs,
   }
   if (elapsedAtLeast(inputs.nowMs, cornerStartedAtMs_,
                      config_.cornerTimeoutMs)) {
+    if (config_.obstacleRecoveryPolicy == 3U) {
+      // Keep the same run-anchored target and continue the physical turn. A
+      // slow corner must not become another permanent recovery hold.
+      cornerStartedAtMs_ = inputs.nowMs;
+      cornerReadySinceMs_ = 0U;
+      return;
+    }
     latchFault(FaultCornerTimeout);
     return;
   }
@@ -1539,6 +2165,7 @@ void Controller::updateCorner(const Inputs& inputs,
   }
 
   if (decision_.cornerCount < kRequiredCorners) ++decision_.cornerCount;
+  obstaclePolicyCornerRetries_ = 0U;
   // Recovery is bounded per completed section, as well as by the run clock.
   wallRecoveryAttempts_ = 0;
   decision_.lapCount = decision_.cornerCount / kCornersPerLap;
@@ -1628,7 +2255,12 @@ void Controller::updateCornerDetectionRearm(
       frontReadingUsable(inputs.front, inputs.nowMs) &&
       inputs.front.rangeMm <= config_.frontCornerTriggerMm &&
       expectedOpeningPresent(opening);
-  if (postPassCornerEvidence) {
+  const bool continuationPostPassCornerEvidence =
+      config_.obstacleRecoveryPolicy == 3U &&
+      obstaclePassCornerRecoveryPending_ &&
+      frontReadingUsable(inputs.front, inputs.nowMs) &&
+      inputs.front.rangeMm <= config_.frontCornerTriggerMm;
+  if (postPassCornerEvidence || continuationPostPassCornerEvidence) {
     cornerDetectionArmed_ = true;
     decision_.cornerDetectionArmed = true;
     cornerRearmClearSinceMs_ = 0;
@@ -1664,6 +2296,7 @@ void Controller::updateNavigation(const Inputs& inputs,
                                   const WallGuidance& wall,
                                   const OpeningEvidence& opening) {
   if (decision_.state == RunState::DirectionProbe) {
+    updateFirstDirectionPathEvidence(inputs);
     // A starting-straight pillar is not a wall opening. Finish the committed
     // red/green pass first, then resume direction learning and its ambiguity
     // boundary with fresh evidence.
@@ -1775,41 +2408,89 @@ void Controller::updateNavigation(const Inputs& inputs,
             8.0F) {
       candidate = opticalProbeDirection_;
     }
-    if (elapsedAtLeast(inputs.nowMs, directionProbeTimerStartedAtMs_,
-                       config_.directionTimeoutMs)) {
-      latchFault(FaultDirectionTimeout);
+    if (config_.obstacleRecoveryPolicy == 3U && closeEnoughToFirstCorner) {
+      candidate = config_.obstacleFallbackDirection;
+    }
+    const bool directionConfirmed =
+        config_.obstacleRecoveryPolicy == 3U && closeEnoughToFirstCorner
+            ? true
+            : openingConfirmed(candidate, inputs);
+    if (handleFirstDirectionBackoff(inputs, candidate, directionConfirmed)) {
       return;
     }
-    const bool directionConfirmed = openingConfirmed(candidate, inputs);
+    if (elapsedAtLeast(inputs.nowMs, directionProbeTimerStartedAtMs_,
+                       config_.directionTimeoutMs)) {
+      const bool freshNormalTurn = directionConfirmed &&
+          frontReadingUsable(inputs.front, inputs.nowMs) &&
+          inputs.front.rangeMm > config_.directionProbeAbortFrontMm;
+      if (config_.obstacleRecoveryPolicy == 3U) {
+        // Keep advancing toward a measurable front wall. The fixed direction
+        // is selected before upload from the direction announced for the
+        // round, so weak side returns cannot turn this into a permanent hold.
+        directionProbeTimerStartedAtMs_ = inputs.nowMs;
+      } else if (!config_.openOpticalRecoveryEnabled ||
+          config_.obstacleAvoidanceEnabled) {
+        latchFault(FaultDirectionTimeout);
+        return;
+      }
+      if (config_.obstacleRecoveryPolicy != 3U && !freshNormalTurn) {
+        directionDecisionHoldActive_ = true;
+        decision_.faultFlags = FaultDirectionAmbiguous;
+        return;
+      }
+    }
     const bool atDirectionAbortBoundary =
         frontReadingUsable(inputs.front, inputs.nowMs) &&
         inputs.front.rangeMm <= config_.directionProbeAbortFrontMm;
     const bool physicalForwardDirectionProbe =
         !config_.sideSensorPairsAreParallel;
+    const bool recoverableFirstDirectionHold =
+        config_.firstDirectionApproachHoldEnabled &&
+        !config_.obstacleAvoidanceEnabled && physicalForwardDirectionProbe;
     if (directionConfirmed &&
-        (!physicalForwardDirectionProbe || !atDirectionAbortBoundary)) {
+        (!physicalForwardDirectionProbe || !atDirectionAbortBoundary ||
+         config_.obstacleRecoveryPolicy == 3U)) {
       directionDecisionHoldSinceMs_ = 0;
       directionDecisionHoldActive_ = false;
       decision_.direction = candidate;
       enterCorner(inputs);
-    } else if (atDirectionAbortBoundary) {
-      if (physicalForwardDirectionProbe) {
+    } else if (atDirectionAbortBoundary ||
+               (recoverableFirstDirectionHold &&
+                directionDecisionHoldActive_)) {
+      if (config_.openOpticalRecoveryEnabled && !config_.obstacleAvoidanceEnabled) {
+        decision_.faultFlags = FaultDirectionAmbiguous;
+      }
+      if (physicalForwardDirectionProbe && !recoverableFirstDirectionHold &&
+          config_.obstacleRecoveryPolicy != 3U) {
         // The physical chassis has a wide 1.0 m decision window. Reaching
         // 600 mm without a fully confirmed direction is too late to begin a
         // safe powered turn in either challenge profile.
-        latchFault(FaultDirectionAmbiguous);
+        if (config_.openOpticalRecoveryEnabled && !config_.obstacleAvoidanceEnabled) {
+          directionDecisionHoldActive_ = true;
+          decision_.faultFlags = FaultDirectionAmbiguous;
+        } else {
+          latchFault(FaultDirectionAmbiguous);
+        }
         return;
       }
-      // Stop at the decision boundary while the opening confirmation settles.
-      // A real candidate normally completes within openingConfirmationMs; a
-      // tied, missing, or flickering candidate gets only this bounded hold.
+      // A motor-neutral candidate can coast across 600 mm before the three
+      // acquisitions finish. Keep Open stopped for a bounded reacquisition
+      // instead of latching on that single crossing. Recovery still requires
+      // a live confirmed direction AND front clearance above the boundary;
+      // no late turn or blind reverse is authorized here.
       if (!directionDecisionHoldActive_) {
         directionDecisionHoldActive_ = true;
         directionDecisionHoldSinceMs_ = inputs.nowMs;
       } else if (elapsedAtLeast(inputs.nowMs,
                                 directionDecisionHoldSinceMs_,
-                                config_.directionDecisionHoldMs)) {
-        latchFault(FaultDirectionAmbiguous);
+                                recoverableFirstDirectionHold
+                                    ? kFirstDirectionBoundaryHoldMs
+                                    : config_.directionDecisionHoldMs)) {
+        if (config_.openOpticalRecoveryEnabled && !config_.obstacleAvoidanceEnabled) {
+          decision_.faultFlags = FaultDirectionAmbiguous;
+        } else {
+          latchFault(FaultDirectionAmbiguous);
+        }
       }
     } else {
       directionDecisionHoldSinceMs_ = 0;
@@ -1861,7 +2542,10 @@ void Controller::updateNavigation(const Inputs& inputs,
     // optically blind Open evidence, and every Obstacle corner.  At full Open
     // speed that redundant delay consumed roughly 160 mm in the field and
     // made the steering reverse from straight-wall correction too late.
-    if (!config_.obstacleAvoidanceEnabled && frontSuggestsCorner) {
+    if ((!config_.obstacleAvoidanceEnabled ||
+         config_.obstacleRecoveryPolicy == 3U) &&
+        frontSuggestsCorner && committedObstacle_ == ObstacleTarget::None &&
+        obstacleRecenterStartOffsetMm_ == 0) {
       enterCorner(inputs);
       return;
     }
@@ -1896,15 +2580,23 @@ void Controller::updateNavigation(const Inputs& inputs,
         frontReadingUsable(inputs.front, inputs.nowMs) &&
         inputs.front.rangeMm > config_.frontCornerTriggerMm;
     if (config_.obstacleAvoidanceEnabled &&
+        config_.obstacleRecoveryPolicy != 3U &&
         expectedOpeningPresent(opening) && !guardedStraightFinish) {
       latchFault(FaultFinishTimeout);
       return;
     }
     decision_.directedProgressDegrees = courseProgressDegrees();
     const bool openFinishReady = !config_.obstacleAvoidanceEnabled;
+    const bool continuationFinishReady =
+        config_.obstacleRecoveryPolicy == 3U &&
+        absoluteValue(headingRemainderDegrees(relativeHeading)) <=
+            config_.finishAlignmentDegrees &&
+        ((frontReadingUsable(inputs.front, inputs.nowMs) &&
+          inputs.front.rangeMm > config_.frontCornerTriggerMm) ||
+         sideReadingIsOpen(inputs.front, inputs.nowMs));
     const bool finishGeometryReady =
         elapsedAtLeast(inputs.nowMs, finishEnteredAtMs_, config_.finishDriveMs) &&
-        (openFinishReady ||
+        (openFinishReady || continuationFinishReady ||
          (absoluteValue(headingRemainderDegrees(relativeHeading)) <=
               config_.finishAlignmentDegrees &&
           (straightSideGeometryUsable(inputs, wall) ||
@@ -2101,6 +2793,38 @@ void Controller::updateObstacle(const Inputs& inputs) {
       }
     } else if (obstacleAbsentSinceMs_ == 0U) {
       obstacleAbsentSinceMs_ = inputs.nowMs;
+    }
+  }
+
+  if (config_.obstacleRecoveryPolicy == 3U &&
+      committedObstacle_ != ObstacleTarget::None) {
+    const BlobReading& continuationBlob =
+        committedObstacle_ == ObstacleTarget::RedPassRight
+            ? inputs.vision.red : inputs.vision.green;
+    const bool freshTargetGone = freshVision && !blobUsable(continuationBlob) &&
+        obstacleAbsentSinceMs_ != 0U &&
+        elapsedAtLeast(inputs.nowMs, obstacleAbsentSinceMs_,
+                       config_.obstacleBlobLossMs);
+    const bool cameraGone = !freshVision && inputs.vision.updatedAtMs != 0U &&
+        elapsedAtLeast(inputs.nowMs, inputs.vision.updatedAtMs,
+                       config_.visionLossGraceMs);
+    const bool commitmentExpired = config_.obstacleMaximumCommitMs > 0U &&
+        elapsedAtLeast(inputs.nowMs, obstacleCommittedAtMs_,
+                       config_.obstacleMaximumCommitMs);
+    const bool escapeFailed = obstacleCenteredEscapeActive_ &&
+        (obstacleCenteredEscapeClearanceViolated_ ||
+         (!obstacleCenteredEscapeTurnComplete_ &&
+          centeredEscapeElapsedMs(inputs.nowMs) >=
+              config_.obstacleCenteredEscapeDeadlineMs));
+    if (freshTargetGone || cameraGone || commitmentExpired || escapeFailed) {
+      const ObstacleTarget skipped = committedObstacle_;
+      clearCommittedObstacle(inputs.nowMs, false);
+      recoverySkippedObstacle_ = skipped;
+      recoverySkippedObstacleAtMs_ = inputs.nowMs;
+      obstaclePassCornerRecoveryPending_ = true;
+      decision_.obstacle = ObstacleTarget::None;
+      decision_.targetLateralOffsetMm = 0;
+      return;
     }
   }
 
@@ -2805,6 +3529,36 @@ uint16_t Controller::applySpeedSlew(uint16_t requestedSpeed, uint32_t nowMs,
 
 void Controller::makeMotionDecision(const Inputs& inputs,
                                     const WallGuidance& wall) {
+  if (config_.obstacleRecoveryPolicy > 0U && config_.obstacleAvoidanceEnabled &&
+      obstaclePolicyHoldFlags_ != 0U) {
+    decision_.faultFlags = obstaclePolicyHoldFlags_;
+    decision_.motionAllowed = false;
+    decision_.speedPermille = 0U;
+    decision_.steeringPermille = 0;
+    decision_.driveDirection = driveDirectionInterlock_.update(
+        DriveDirection::Stopped, inputs.nowMs, config_.parkingReverseNeutralMs);
+    lastCommandedSpeedPermille_ = 0U;
+    lastSpeedCommandAtMs_ = inputs.nowMs;
+    return;
+  }
+  if (config_.obstacleRecoveryPolicy == 2U && config_.obstacleAvoidanceEnabled &&
+      decision_.startLatched && decision_.state != RunState::FaultLatched &&
+      decision_.state != RunState::Finished && !visionFreshAndValid(inputs) &&
+      (!obstaclePolicyRangeDriving_ ||
+       !obstacleMeasuredRouteReady(inputs, 350U, true))) {
+    obstaclePolicyCameraHold_ = true;
+    obstaclePolicyRangeDriving_ = false;
+    obstaclePolicyClearSamples_ = 0U;
+    decision_.faultFlags = FaultVisionUnavailable;
+    decision_.motionAllowed = false;
+    decision_.speedPermille = 0U;
+    decision_.steeringPermille = 0;
+    decision_.driveDirection = driveDirectionInterlock_.update(
+        DriveDirection::Stopped, inputs.nowMs, config_.parkingReverseNeutralMs);
+    lastCommandedSpeedPermille_ = 0U;
+    lastSpeedCommandAtMs_ = inputs.nowMs;
+    return;
+  }
   const bool movingState = decision_.state == RunState::DirectionProbe ||
                            decision_.state == RunState::Running ||
                            decision_.state == RunState::Cornering ||
@@ -2904,6 +3658,7 @@ void Controller::makeMotionDecision(const Inputs& inputs,
   if (sideElectricalHold) speed = 0U;
   const bool calibrationCrossOnlyHold =
       guardedPassEnabled() &&
+      config_.obstacleRecoveryPolicy != 3U &&
       !straightSideGeometryUsable(inputs, wall) &&
       !calibrationCrossGuardActive_;
   if (calibrationCrossOnlyHold) speed = 0U;
@@ -2933,16 +3688,24 @@ void Controller::makeMotionDecision(const Inputs& inputs,
       decision_.state == RunState::DirectionProbe &&
       (openChallenge
            ? healthyImuGuidance && anyNumericSideReadingUsable(inputs)
-           : !sideGeometryDegraded_);
+           : config_.obstacleRecoveryPolicy == 3U
+                 ? healthyImuGuidance
+                 : !sideGeometryDegraded_);
   const bool guidedOpenCorner =
       frontOpticallyDegraded_ &&
-      sideReadingIsOpen(inputs.front, inputs.nowMs) && openChallenge &&
+      sideReadingIsOpen(inputs.front, inputs.nowMs) &&
+      (openChallenge ||
+       config_.obstacleRecoveryPolicy == 3U ||
+       (config_.obstacleRecoveryPolicy > 0U &&
+        (visionFreshAndValid(inputs) ||
+         (config_.obstacleRecoveryPolicy == 2U &&
+          obstacleMeasuredRouteReady(inputs, 350U, true))))) &&
       decision_.state == RunState::Cornering && healthyImuGuidance &&
-      (wall.outerWallUsable ||
+      (config_.obstacleRecoveryPolicy == 3U || wall.outerWallUsable ||
        (!config_.sideSensorPairsAreParallel &&
         anyLocalSideReadingUsable(inputs)));
   if ((frontOpticallyDegraded_ && !guidedFarDirectionProbe &&
-       !guidedOpenCorner) ||
+       !guidedOpenCorner && !openOpticalProbeAllowed_) ||
       (!openChallenge && sideGeometryDegraded_)) {
     if (speed > config_.cornerBlindSpeedPermille) {
       speed = config_.cornerBlindSpeedPermille;
@@ -3024,10 +3787,26 @@ void Controller::makeMotionDecision(const Inputs& inputs,
   }
 
   uint16_t confidenceCap = 1000U;
+  const bool firstDirectionApproachCap =
+      config_.firstDirectionApproachHoldEnabled && openChallenge &&
+      diagonalChassis && decision_.state == RunState::DirectionProbe &&
+      frontReadingUsable(inputs.front, inputs.nowMs) &&
+      inputs.front.rangeMm <= config_.directionProbeFrontMaximumMm;
+  if (firstDirectionApproachCap &&
+      speed > kFirstDirectionApproachSpeedPermille) {
+    speed = kFirstDirectionApproachSpeedPermille;
+  }
   bool safetySpeedCap =
       rangeUncertainCap || directionDecisionHold || requiredVisionHold ||
       sideElectricalHold || cornerSteeringPreposition ||
-      calibrationCrossOnlyHold;
+      calibrationCrossOnlyHold || firstDirectionApproachCap;
+  if (config_.openOpticalRecoveryEnabled && !config_.obstacleAvoidanceEnabled &&
+      openOpticalProbeAllowed_) {
+    const uint16_t opticalCap = decision_.state == RunState::Cornering
+        ? config_.cornerSpeedPermille : kOpenOpticalProbeSpeedPermille;
+    if (speed > opticalCap) speed = opticalCap;
+    safetySpeedCap = true;
+  }
   if (obstacleCenteredEscapeActive_ && !obstacleBodyClearActive_) {
     if (centeredEscapeFailed) {
       speed = 0U;
@@ -3040,6 +3819,7 @@ void Controller::makeMotionDecision(const Inputs& inputs,
   }
   const bool unconfirmedObstacleLossHold =
       committedObstacle_ != ObstacleTarget::None &&
+      config_.obstacleRecoveryPolicy != 3U &&
       !(config_.guardedObstaclePassEnabled && obstacleCenteredEscapeActive_) &&
       !centeredEscapePostTurnActive() &&
       obstaclePeakBottomY_ < config_.obstacleCloseBottomY &&
@@ -3053,7 +3833,16 @@ void Controller::makeMotionDecision(const Inputs& inputs,
     speed = 0U;
     safetySpeedCap = true;
   }
-  if (config_.obstacleAvoidanceEnabled) {
+  const bool independentObstacleRoute = config_.obstacleRecoveryPolicy == 2U &&
+      obstaclePolicyRangeDriving_ && !visionFreshAndValid(inputs) &&
+      obstacleMeasuredRouteReady(inputs, 350U, true);
+  if (independentObstacleRoute) {
+    const uint16_t routeCap = decision_.state == RunState::Cornering
+        ? config_.cornerSpeedPermille : 400U;
+    if (speed > routeCap) speed = routeCap;
+    safetySpeedCap = true;
+  }
+  if (config_.obstacleAvoidanceEnabled && !independentObstacleRoute) {
     if (!visionFreshAndValid(inputs)) {
       confidenceCap = config_.visionUncertainSpeedPermille;
       safetySpeedCap = true;
@@ -3730,6 +4519,33 @@ void Controller::makeMotionDecision(const Inputs& inputs,
 }
 
 void Controller::latchFault(uint32_t flags) {
+  const uint32_t recoverableManeuverFaults = FaultDirectionAmbiguous |
+      FaultDirectionTimeout | FaultCornerTimeout | FaultObstaclePassTimeout;
+  if (config_.obstacleRecoveryPolicy > 0U && config_.obstacleAvoidanceEnabled &&
+      flags != FaultNone && (flags & ~recoverableManeuverFaults) == 0U &&
+      decision_.state != RunState::FaultLatched && decision_.state != RunState::Finished) {
+    if (obstaclePolicyHoldFlags_ == 0U) {
+      obstaclePolicyHoldFrontMm_ = obstaclePolicyLatestFrontMm_;
+      obstaclePolicyHoldHeadingDegrees_ = unwrappedHeadingDegrees_;
+      obstaclePolicyClearSamples_ = 0U;
+    }
+    obstaclePolicyHoldFlags_ |= flags;
+    decision_.faultFlags = obstaclePolicyHoldFlags_;
+    decision_.motionAllowed = false;
+    decision_.speedPermille = 0U;
+    decision_.driveDirection = DriveDirection::Stopped;
+    decision_.steeringPermille = 0;
+    lastCommandedSpeedPermille_ = 0U;
+    resetObstacleHoldProofs();
+    return;
+  }
+  if (firstDirectionBackoffDirection_ != CourseDirection::Unknown) {
+    firstDirectionBackoffDirection_ = CourseDirection::Unknown;
+    decision_.wallRecoveryPhase = 0U;
+  }
+  obstaclePolicyHoldFlags_ = 0U;
+  obstaclePolicyCameraHold_ = false;
+  obstaclePolicyRangeDriving_ = false;
   latchedFaultFlags_ |= flags;
   decision_.faultFlags = latchedFaultFlags_;
   decision_.state = RunState::FaultLatched;
@@ -3742,6 +4558,7 @@ void Controller::latchFault(uint32_t flags) {
 
 bool Controller::handleForwardSideEscape(const Inputs& inputs,
                                          uint32_t safetyFaults) {
+  if (config_.obstacleRecoveryPolicy > 0U && obstaclePolicyHoldFlags_ != 0U) return false;
   if (!config_.preferForwardObstacleProgress ||
       !config_.guardedObstaclePassEnabled ||
       config_.stopAfterFirstVerifiedObstaclePass) return false;
@@ -3872,7 +4689,8 @@ bool Controller::handleForwardSideEscape(const Inputs& inputs,
     // its ordinary absolute-heading, timeout and stable-exit proof running;
     // a local escape budget must not bypass the cardinal or count it blindly.
     updateCorner(inputs, computeWallGuidance(inputs), OpeningEvidence{});
-    if (decision_.state == RunState::FaultLatched) {
+    if (decision_.state == RunState::FaultLatched ||
+        (config_.obstacleRecoveryPolicy > 0U && obstaclePolicyHoldFlags_ != 0U)) {
       forwardSideEscapeActive_ = false;
       return true;
     }
@@ -4134,11 +4952,12 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
         currentHeading;
     if ((!retryHealth &&
          !wallRecoveryInputsReady(inputs, sideHazards != 0U, false)) ||
-        wallRecoveryAttempts_ >= 3U) {
+        (wallRecoveryAttempts_ >= 3U &&
+         config_.obstacleRecoveryPolicy != 3U)) {
       latchFault(FaultFrontTooClose);
       return true;
     }
-    ++wallRecoveryAttempts_;
+    if (wallRecoveryAttempts_ < 255U) ++wallRecoveryAttempts_;
     wallRecoveryHeadingReferenceDegrees_ = reference;
     wallRecoveryStartedAtMs_ = inputs.nowMs;
     wallRecoveryPhaseStartedAtMs_ = inputs.nowMs;
@@ -4168,7 +4987,10 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
                               FaultSideGeometryUnavailable) : 0U);
   const uint32_t elapsed = inputs.nowMs - wallRecoveryUpdatedAtMs_;
   wallRecoveryUpdatedAtMs_ = inputs.nowMs;
-  if (wallRecoveryHealthHoldActive_) {
+  if (wallRecoveryHealthHoldActive_ &&
+      (config_.obstacleRecoveryPolicy == 0U ||
+       (inputs.driveFeedbackAvailable && inputs.appliedDrivePermille == 0U &&
+        decision_.speedPermille == 0U))) {
     // The three-second maneuver bound counts usable recovery time. Sensor
     // waiting is stopped and remains bounded by the absolute whole-run limit.
     wallRecoveryStartedAtMs_ += elapsed;
@@ -4183,7 +5005,16 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
     latchFault(FaultRunTimeout);
     return true;
   }
-  const auto holdForRecoveryHealth = [&](uint32_t faults) {
+  const auto holdForRecoveryHealth = [&](uint32_t faults, bool discardProof = true) {
+    if (config_.obstacleRecoveryPolicy > 0U && inputs.imu.online &&
+        inputs.imu.valid && isfinite(inputs.imu.yawDegrees) &&
+        readingFresh(inputs.nowMs, inputs.imu.updatedAtMs, config_.sensorStaleMs)) {
+      if (!updateHeading(inputs)) {
+        latchFault(FaultHeadingJump);
+        return true;
+      }
+      resetObstacleHoldProofs();
+    }
     wallRecoveryHealthHoldActive_ = true;
     decision_.faultFlags = faults;
     decision_.motionAllowed = false;
@@ -4195,17 +5026,19 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
     lastSpeedCommandAtMs_ = inputs.nowMs;
     // Unknown measurements break consecutive clearance proof. Reacquire it
     // from distinct fresh samples after the observation stream recovers.
-    wallRecoveryClearSamples_ = 0;
-    wallRecoveryClearSinceMs_ = 0;
-    wallRecoveryClearLastEvidenceMs_ = 0;
-    wallRecoveryClearLeftSampleMs_ = 0;
-    wallRecoveryClearRightSampleMs_ = 0;
-    wallRecoveryForwardSamples_ = 0;
-    wallRecoveryForwardSinceMs_ = 0;
-    wallRecoveryForwardEvidenceMs_ = 0;
-    wallRecoveryForwardFrontSampleMs_ = 0;
-    wallRecoveryForwardLeftSampleMs_ = 0;
-    wallRecoveryForwardRightSampleMs_ = 0;
+    if (discardProof) {
+      wallRecoveryClearSamples_ = 0;
+      wallRecoveryClearSinceMs_ = 0;
+      wallRecoveryClearLastEvidenceMs_ = 0;
+      wallRecoveryClearLeftSampleMs_ = 0;
+      wallRecoveryClearRightSampleMs_ = 0;
+      wallRecoveryForwardSamples_ = 0;
+      wallRecoveryForwardSinceMs_ = 0;
+      wallRecoveryForwardEvidenceMs_ = 0;
+      wallRecoveryForwardFrontSampleMs_ = 0;
+      wallRecoveryForwardLeftSampleMs_ = 0;
+      wallRecoveryForwardRightSampleMs_ = 0;
+    }
     return true;
   };
   const uint32_t transientHealthFaults =
@@ -4330,12 +5163,22 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
        (plannedTimeLimitedRetry && forwardRouteReady && wallRecoveryPoweredMs_ >= 250U));
   const bool hardRearDepartureReady = !rearRayAtOrBelow(inputs, 200U) ||
       rearLimitedForwardDepartureReady(inputs);
-  const bool mayExit = (rearLimited ? partialDepartureReady
-                                  : recoveryClear || partialDepartureReady) &&
+  const bool continuationForwardReady =
+      config_.obstacleRecoveryPolicy == 3U &&
+      ((frontReadingUsable(inputs.front, inputs.nowMs) &&
+        inputs.front.rangeMm > 350U) ||
+       sideReadingIsOpen(inputs.front, inputs.nowMs));
+  const bool mayExit =
+      ((rearLimited ? partialDepartureReady
+                    : recoveryClear || partialDepartureReady) ||
+       continuationForwardReady) &&
       hardRearDepartureReady;
   if (decision_.wallRecoveryPhase == 3U &&
       elapsedAtLeast(inputs.nowMs, wallRecoveryPhaseStartedAtMs_, 300U) &&
       !mayExit && !rearLimited && !plannedTimeLimitedRetry) {
+      if (config_.obstacleRecoveryPolicy > 0U) {
+        return holdForRecoveryHealth(FaultFrontTooClose, false);
+      }
       latchFault(FaultFrontTooClose);
       return true;
   }
@@ -4401,6 +5244,9 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
   }
   if (decision_.wallRecoveryPhase != 0U &&
       elapsedAtLeast(inputs.nowMs, wallRecoveryStartedAtMs_, 3000U)) {
+    if (config_.obstacleRecoveryPolicy > 0U && decision_.wallRecoveryPhase == 3U) {
+      return holdForRecoveryHealth(FaultFrontTooClose, false);
+    }
     latchFault(FaultFrontTooClose);
     return true;
   }
@@ -4440,11 +5286,43 @@ bool Controller::handleWallRecovery(const Inputs& inputs, uint32_t safetyFaults)
 }
 
 Decision Controller::update(const Inputs& inputs) {
+  updateObstacleHoldTime(inputs);
+  updateOpenOpticalRecoveryTime(inputs);
   updateCenteredEscapeDriveTime(inputs);
   const bool startEdge = updateButton(inputs);
 
   WallGuidance wall;
   const uint32_t currentSafetyFaults = evaluateSafety(inputs, wall);
+  if (config_.obstacleRecoveryPolicy > 0U &&
+      (currentSafetyFaults != FaultNone || sideElectricalLossActive_ ||
+       (config_.requireVisionForMotion && visionLossActive_))) {
+    obstaclePolicyClearSamples_ = 0U;
+  }
+  if (config_.obstacleRecoveryPolicy > 0U &&
+      frontReadingUsable(inputs.front, inputs.nowMs)) {
+    obstaclePolicyLatestFrontMm_ = inputs.front.rangeMm;
+  }
+  const bool recoverableOpenOpticalFault =
+      config_.openOpticalRecoveryEnabled && !config_.obstacleAvoidanceEnabled &&
+      firstDirectionBackoffDirection_ == CourseDirection::Unknown &&
+      inputs.front.online && inputs.front.i2cStatus == 0U &&
+      readingFresh(inputs.nowMs, inputs.front.updatedAtMs, config_.sensorStaleMs) &&
+      !frontReadingUsable(inputs.front, inputs.nowMs) &&
+      opticalNoTargetStatus(inputs.front.rangeStatus) &&
+      (currentSafetyFaults & ~uint32_t(FaultFrontTofUnavailable)) == 0U;
+  const uint32_t pathHealthFaults = FaultImuUnavailable | FaultImuStale |
+      FaultImuUncalibrated | FaultFrontTofUnavailable | FaultFrontTofStale |
+      FaultSideTofUnavailable | FaultSideTofStale;
+  if (((currentSafetyFaults & pathHealthFaults) != 0U &&
+       !recoverableOpenOpticalFault) ||
+      sideElectricalLossActive_) {
+    resetFirstDirectionPathEvidence();
+    if (firstDirectionBackoffDirection_ != CourseDirection::Unknown) {
+      latchFault(currentSafetyFaults != FaultNone ? currentSafetyFaults
+                                                 : uint32_t(FaultSideTofUnavailable));
+      return decision_;
+    }
+  }
   // A legal Open start may have no numeric side target or a target beyond the
   // opening-reference range. Learn a missing close-wall baseline while the
   // direction probe is still safely outside its stop boundary. This prevents
@@ -4574,6 +5452,15 @@ Decision Controller::update(const Inputs& inputs) {
   }
   if (config_.wallRecoveryEnabled && currentSafetyFaults != FaultNone &&
       (currentSafetyFaults & ~transientHealthFaults) == 0U) {
+    if (config_.obstacleRecoveryPolicy > 0U && inputs.imu.online &&
+        inputs.imu.valid && isfinite(inputs.imu.yawDegrees) &&
+        readingFresh(inputs.nowMs, inputs.imu.updatedAtMs, config_.sensorStaleMs)) {
+      if (!updateHeading(inputs)) {
+        latchFault(FaultHeadingJump);
+        return decision_;
+      }
+      resetObstacleHoldProofs();
+    }
     if (decision_.wallRecoveryPhase != 0U &&
         elapsedAtLeast(inputs.nowMs, wallRecoveryStartedAtMs_, 3000U)) {
       latchFault(FaultFrontTooClose);
@@ -4594,7 +5481,7 @@ Decision Controller::update(const Inputs& inputs) {
     return decision_;
   }
   if (handleWallRecovery(inputs, currentSafetyFaults)) return decision_;
-  if (currentSafetyFaults != FaultNone) {
+  if (currentSafetyFaults != FaultNone && !recoverableOpenOpticalFault) {
     latchFault(currentSafetyFaults);
     return decision_;
   }
@@ -4608,6 +5495,7 @@ Decision Controller::update(const Inputs& inputs) {
     return decision_;
   }
   if (sideElectricalLossActive_) {
+    if (config_.obstacleRecoveryPolicy > 0U) resetObstacleHoldProofs();
     // Hold the current navigation state as well as the motor during the short
     // electrical recovery window. A missing ray must not count a corner or
     // change obstacle commitment while the vehicle is stopped.
@@ -4629,6 +5517,7 @@ Decision Controller::update(const Inputs& inputs) {
     return decision_;
   }
   if (config_.requireVisionForMotion && visionLossActive_) {
+    if (config_.obstacleRecoveryPolicy > 0U) resetObstacleHoldProofs();
     // Required-camera grace is a stopped recovery window, not permission to
     // advance direction, corner, or obstacle state using missing frames.
     obstacleAbsentSinceMs_ = 0;
@@ -4649,6 +5538,9 @@ Decision Controller::update(const Inputs& inputs) {
     return decision_;
   }
 
+  if (handleObstaclePolicy(inputs)) return decision_;
+  if (handleOpenOpticalRecovery(inputs, wall)) return decision_;
+
   // Pillar seats are in straight sections. While a corner is still active,
   // retain any pass already in progress but do not accept a new target. On
   // the exact update that verifies the corner exit, navigation first clears
@@ -4663,7 +5555,9 @@ Decision Controller::update(const Inputs& inputs) {
     }
   } else {
     updateObstacle(inputs);
-    updateNavigation(inputs, wall, opening);
+    if (obstaclePolicyHoldFlags_ == 0U || config_.obstacleRecoveryPolicy == 0U) {
+      updateNavigation(inputs, wall, opening);
+    }
   }
   decision_.unwrappedHeadingDegrees = unwrappedHeadingDegrees_;
   decision_.cornerTargetHeadingDegrees = cornerTargetHeadingDegrees_;
@@ -4684,6 +5578,14 @@ Decision Controller::update(const Inputs& inputs) {
   }
 
   if (decision_.state == RunState::FaultLatched) return decision_;
+  if (obstaclePolicyHoldFlags_ != 0U && config_.obstacleRecoveryPolicy > 0U) {
+    return decision_;
+  }
+  if (firstDirectionBackoffDirection_ != CourseDirection::Unknown) {
+    // The dedicated reverse/neutral command above owns this cycle. Do not
+    // overwrite it with the ordinary forward DirectionProbe motion planner.
+    return decision_;
+  }
   makeMotionDecision(inputs, wall);
   return decision_;
 }

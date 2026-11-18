@@ -182,6 +182,21 @@ struct Config {
   // At the close-front direction boundary, hold the motor stopped while an
   // opening is confirmed. Persistent ambiguity then faults instead of guessing.
   uint32_t directionDecisionHoldMs = 300;
+  // Open-only first-corner approach: reduce approach power, preserve a brief
+  // optical gap while stopped, and give a late boundary sample a bounded
+  // stopped reacquisition window. It never authorizes a turn below the
+  // configured directionProbeAbortFrontMm clearance.
+  bool firstDirectionApproachHoldEnabled = false;
+  // Explicit Open fallback profile only. Optical-only failures hold and
+  // reacquire; a finite actual-powered blind budget never invents direction.
+  bool openOpticalRecoveryEnabled = false;
+  // 0: original obstacle controller; 1: recoverable holds; 2: additionally
+  // permit a freshly measured route when camera observations are unavailable;
+  // 3: field-continuation mode treats fresh optical no-target side results as
+  // open space and uses a configured course direction when optical opening
+  // geometry is unavailable.
+  uint8_t obstacleRecoveryPolicy = 0U;
+  CourseDirection obstacleFallbackDirection = CourseDirection::Unknown;
   uint32_t openingConfirmationMs = 100;
   // A confirmation must span real ToF acquisitions. Fast controller loops
   // are not allowed to count one unchanged range sample several times.
@@ -562,6 +577,21 @@ class Controller {
                     const OpeningEvidence& opening);
   bool expectedOpeningPresent(const OpeningEvidence& opening) const;
   bool openingConfirmed(CourseDirection candidate, const Inputs& inputs);
+  void resetFirstDirectionPathEvidence();
+  void updateFirstDirectionPathEvidence(const Inputs& inputs);
+  bool handleFirstDirectionBackoff(const Inputs& inputs,
+                                   CourseDirection candidate,
+                                   bool directionConfirmed);
+  void resetOpenOpticalRecovery();
+  void updateOpenOpticalRecoveryTime(const Inputs& inputs);
+  bool handleOpenOpticalRecovery(const Inputs& inputs,
+                                 const WallGuidance& wall);
+  void resetObstacleHoldProofs();
+  void updateObstacleHoldTime(const Inputs& inputs);
+  bool obstacleMeasuredRouteReady(const Inputs& inputs,
+                                  uint16_t minimumFrontMm,
+                                  bool requireNumericLeading) const;
+  bool handleObstaclePolicy(const Inputs& inputs);
   float courseProgressDegrees() const;
   void updateObstacle(const Inputs& inputs);
   void refreshCommittedObstacle(const BlobReading& blob);
@@ -638,6 +668,48 @@ class Controller {
   uint32_t lastCornerAtMs_ = 0;
   uint32_t cornerRearmClearSinceMs_ = 0;
   bool cornerDetectionArmed_ = false;
+  bool firstDirectionStartClearanceBlocked_ = false;
+  bool firstDirectionPathAnchorValid_ = false;
+  bool firstDirectionPathWasPowered_ = false;
+  bool firstDirectionBackoffAttempted_ = false;
+  uint32_t firstDirectionPathAnchorAtMs_ = 0;
+  uint32_t firstDirectionPathUpdatedAtMs_ = 0;
+  uint32_t firstDirectionPathPoweredMs_ = 0;
+  uint16_t firstDirectionPathMaximumFrontMm_ = 0;
+  CourseDirection firstDirectionBackoffDirection_ = CourseDirection::Unknown;
+  uint32_t firstDirectionBackoffStartedAtMs_ = 0;
+  uint32_t firstDirectionBackoffUpdatedAtMs_ = 0;
+  uint32_t firstDirectionBackoffPoweredMs_ = 0;
+  uint32_t firstDirectionBackoffNeutralSinceMs_ = 0;
+  bool firstDirectionBackoffNeutralActive_ = false;
+  uint16_t firstDirectionBackoffStartFrontMm_ = 0;
+  float firstDirectionBackoffHeadingDegrees_ = 0.0F;
+  uint32_t firstDirectionBackoffLastFrontAtMs_ = 0;
+  uint8_t firstDirectionBackoffClearSamples_ = 0;
+  bool openOpticalHoldActive_ = false;
+  bool openOpticalProbeAllowed_ = false;
+  bool openOpticalNearFront_ = false;
+  uint32_t openOpticalUpdatedAtMs_ = 0;
+  uint32_t openOpticalPoweredMs_ = 0;
+  uint32_t openOpticalUsefulSinceMs_ = 0;
+  uint32_t openOpticalUsefulEvidenceAtMs_ = 0;
+  uint32_t openOpticalLastUsefulAtMs_ = 0;
+  uint8_t openOpticalEvidenceSource_ = 255U;
+  uint8_t openOpticalUsefulSamples_ = 0;
+  uint32_t obstaclePolicyUpdatedAtMs_ = 0;
+  uint32_t obstaclePolicyHoldFlags_ = 0U;
+  uint16_t obstaclePolicyLatestFrontMm_ = 0U;
+  uint16_t obstaclePolicyHoldFrontMm_ = 0U;
+  float obstaclePolicyHoldHeadingDegrees_ = 0.0F;
+  uint8_t obstaclePolicyCornerRetries_ = 0U;
+  bool obstaclePolicyCameraHold_ = false;
+  bool obstaclePolicyRangeDriving_ = false;
+  uint32_t obstaclePolicyEvidenceSinceMs_ = 0U;
+  uint32_t obstaclePolicyEvidenceAtMs_ = 0U;
+  uint32_t obstaclePolicyLastFrontAtMs_ = 0U;
+  uint32_t obstaclePolicyLastLeftAtMs_ = 0U;
+  uint32_t obstaclePolicyLastRightAtMs_ = 0U;
+  uint8_t obstaclePolicyClearSamples_ = 0U;
   uint32_t cornerStartedAtMs_ = 0;
   uint32_t cornerReadySinceMs_ = 0;
   uint32_t openingCandidateSinceMs_ = 0;

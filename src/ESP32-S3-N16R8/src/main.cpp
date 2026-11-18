@@ -27,6 +27,18 @@
 #define BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION 0
 #endif
 
+#ifndef BUBBLEGUM_OPEN_OPTICAL_FALLBACK
+#define BUBBLEGUM_OPEN_OPTICAL_FALLBACK 0
+#endif
+
+#ifndef BUBBLEGUM_OBSTACLE_RECOVERY_POLICY
+#define BUBBLEGUM_OBSTACLE_RECOVERY_POLICY 0
+#endif
+
+#ifndef BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION
+#define BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION 0
+#endif
+
 #ifndef BUBBLEGUM_CALIBRATION_MAX_RUN_MS
 #define BUBBLEGUM_CALIBRATION_MAX_RUN_MS 8000
 #endif
@@ -44,6 +56,26 @@ static_assert(BUBBLEGUM_AUTONOMY_PROFILE == BUBBLEGUM_AUTONOMY_PROFILE_OPEN ||
 static_assert(BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION == 0 ||
                   BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION == 1,
               "BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION must be 0 or 1");
+static_assert(BUBBLEGUM_OPEN_OPTICAL_FALLBACK == 0 ||
+                  BUBBLEGUM_OPEN_OPTICAL_FALLBACK == 1,
+              "BUBBLEGUM_OPEN_OPTICAL_FALLBACK must be 0 or 1");
+static_assert(!BUBBLEGUM_OPEN_OPTICAL_FALLBACK ||
+                  BUBBLEGUM_AUTONOMY_PROFILE == BUBBLEGUM_AUTONOMY_PROFILE_OPEN,
+              "Optical fallback is available only for Open");
+static_assert(BUBBLEGUM_OBSTACLE_RECOVERY_POLICY >= 0 &&
+                  BUBBLEGUM_OBSTACLE_RECOVERY_POLICY <= 3,
+              "Obstacle recovery policy must be 0, 1, 2, or 3");
+static_assert(BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 0 ||
+                  (BUBBLEGUM_AUTONOMY_PROFILE == BUBBLEGUM_AUTONOMY_PROFILE_OBSTACLE &&
+                   !BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION),
+              "Obstacle backups require the full-course Obstacle profile");
+static_assert(BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION == 0 ||
+                  BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION == -1 ||
+                  BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION == 1,
+              "Obstacle fallback direction must be -1 (CW), 0, or 1 (CCW)");
+static_assert(BUBBLEGUM_OBSTACLE_RECOVERY_POLICY != 3 ||
+                  BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION != 0,
+              "Field-continuation obstacle firmware needs CW or CCW");
 
 #if BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION
 static_assert(BUBBLEGUM_ENABLE_ACTUATION == 1,
@@ -89,10 +121,22 @@ constexpr autonomy::ChallengeProfile CONTROLLER_PROFILE =
 #endif
 
 autonomy::Config makeBuildControllerConfig() {
+#if BUBBLEGUM_OPEN_OPTICAL_FALLBACK
+  autonomy::Config config = autonomy::makeOpenFallbackConfig();
+#elif BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 3
+  autonomy::Config config = autonomy::makeObstacleContinueConfig(
+      BUBBLEGUM_OBSTACLE_FALLBACK_DIRECTION < 0
+          ? autonomy::CourseDirection::Clockwise
+          : autonomy::CourseDirection::CounterClockwise);
+#elif BUBBLEGUM_OBSTACLE_RECOVERY_POLICY != 0
+  autonomy::Config config = autonomy::makeObstacleFallbackConfig(
+      BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 2);
+#else
   autonomy::Config config =
       CONTROLLER_PROFILE == autonomy::ChallengeProfile::Obstacle
           ? autonomy::makeGuardedObstacleConfig()
           : autonomy::makeControllerConfig(CONTROLLER_PROFILE);
+#endif
 #if BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION
   config.stopAfterFirstVerifiedObstaclePass = true;
   config.preferForwardObstacleProgress = false;
@@ -322,6 +366,10 @@ bool sideGeometryRawHealthy(uint32_t nowMs, bool allowCrossPair) {
   // Obstacle Challenge keeps the stricter geometry gate.
   if (!controller.config().obstacleAvoidanceEnabled) return true;
   if (controller.config().guardedObstaclePassEnabled) {
+    // R45 still requires all four modules to answer electrically above. A
+    // fresh status 1/2/4/6/7 means the ray found no trustworthy nearby target,
+    // which the field-continuation profile deliberately treats as open.
+    if (controller.config().obstacleRecoveryPolicy == 3U) return true;
     return valid[0] || valid[1] || valid[2] || valid[3];
   }
 
@@ -866,6 +914,14 @@ void setup() {
 #if BUBBLEGUM_ENABLE_ACTUATION
 #if BUBBLEGUM_OBSTACLE_SINGLE_PASS_CALIBRATION
   Serial.println(F("BUBBLEGUM AUTONOMOUS OBSTACLE 20260905-R42 SINGLE PASS - AUTO-STOP"));
+#elif BUBBLEGUM_OPEN_OPTICAL_FALLBACK
+  Serial.println(autonomy::openFallbackSourceIdentity());
+#elif BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 3
+  Serial.println(autonomy::obstacleContinueSourceIdentity(
+      controller.config().obstacleFallbackDirection));
+#elif BUBBLEGUM_OBSTACLE_RECOVERY_POLICY != 0
+  Serial.println(autonomy::obstacleFallbackSourceIdentity(
+      BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 2));
 #else
   Serial.println(autonomy::controllerSourceIdentity(CONTROLLER_PROFILE));
 #endif
@@ -879,7 +935,13 @@ void setup() {
   Serial.println(F("arming requires XMS-A5 gyro calibration >= 2 for 1 second"));
   Serial.println(F("direction: first side-wall opening; laps: 12 verified corner exits"));
 #if BUBBLEGUM_AUTONOMY_PROFILE == BUBBLEGUM_AUTONOMY_PROFILE_OBSTACLE
+#if BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 3
+  Serial.println(F("challenge=OBSTACLE pillars=ACTIVE vision=OPTIONAL optical_no_target=OPEN fixed_direction=YES parking=DISABLED"));
+#elif BUBBLEGUM_OBSTACLE_RECOVERY_POLICY == 2
+  Serial.println(F("challenge=OBSTACLE pillars=ACTIVE vision=OPTIONAL_WITH_RANGE_ROUTE parking=DISABLED"));
+#else
   Serial.println(F("challenge=OBSTACLE pillars=ACTIVE vision=REQUIRED parking=DISABLED"));
+#endif
 #else
   Serial.println(F("challenge=OPEN pillars=IGNORED parking=DISABLED"));
 #endif
@@ -897,6 +959,8 @@ void setup() {
   Serial.print(controller.config().openOuterWallTargetMm);
   Serial.print(F(",side_pairs_parallel="));
   Serial.print(controller.config().sideSensorPairsAreParallel ? 1 : 0);
+  Serial.print(F(",first_direction_hold="));
+  Serial.print(controller.config().firstDirectionApproachHoldEnabled ? 1 : 0);
   Serial.print(F(",single_pass="));
   Serial.print(controller.config().stopAfterFirstVerifiedObstaclePass ? 1 : 0);
   Serial.print(F(",guarded_obstacle="));
@@ -925,7 +989,9 @@ void setup() {
   Serial.print(controller.config().guardedObstaclePassEnabled
                    ? F("applied_drive") : F("wall_time"));
   Serial.print(F(",max_run_ms="));
-  Serial.println(controller.config().maxRunMs);
+  Serial.print(controller.config().maxRunMs);
+  Serial.print(F(",obstacle_recovery_policy="));
+  Serial.println(controller.config().obstacleRecoveryPolicy);
   if (controller.config().guardedObstaclePassEnabled) {
     Serial.println(F("VISION_GEOMETRY_HEADER,ms,vision_sample_ms,red_present,red_x,red_bottom,red_width,red_height,green_present,green_x,green_bottom,green_width,green_height"));
   }

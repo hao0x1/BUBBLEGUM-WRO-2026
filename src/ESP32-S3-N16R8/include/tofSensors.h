@@ -24,6 +24,11 @@ class TofSensors {
     uint32_t lastUpdateMs = 0;
     uint32_t sampleCount = 0;
     uint32_t busErrorCount = 0;
+    uint16_t signalRateKcps = 0;
+    uint16_t ambientRateKcps = 0;
+    uint16_t sigmaMm = 0;
+    uint8_t spadCount = 0;
+    bool qualityAvailable = false;
   };
 
   void begin(TwoWire& wire, bool busAvailable, Print& log);

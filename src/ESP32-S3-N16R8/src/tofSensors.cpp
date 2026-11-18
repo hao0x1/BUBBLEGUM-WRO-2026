@@ -4,6 +4,16 @@
 
 namespace {
 
+#ifndef BUBBLEGUM_OPEN_FIELD_SENSING
+#define BUBBLEGUM_OPEN_FIELD_SENSING 0
+#endif
+
+// The field returned low-signal side samples at the old 20 ms budget.
+// Use the device's 50 ms default for the Open field revision. Keep validity,
+// signal thresholds and emergency distances unchanged.
+constexpr uint8_t sideTimingBudgetMs =
+    BUBBLEGUM_OPEN_FIELD_SENSING ? 50U : 20U;
+
 constexpr uint8_t SIDE_XSHUT_PINS[] = {
     board::TOF_FRONT_LEFT_XSHUT_PIN,
     board::TOF_BACK_LEFT_XSHUT_PIN,
@@ -96,7 +106,7 @@ bool TofSensors::initializeSide(size_t index, Print& log) {
   sensor.setAddress(SIDE_ADDRESSES[index]);
   delay(2);
   if (!addressResponds(*wire_, SIDE_ADDRESSES[index]) ||
-      !sensor.setRangeTiming(20U, 0U)) {
+      !sensor.setRangeTiming(sideTimingBudgetMs, 0U)) {
     log.print(F("[tof] "));
     log.print(SIDE_NAMES[index]);
     log.println(F(" VL53L4CD configure/address check failed"));
@@ -108,7 +118,9 @@ bool TofSensors::initializeSide(size_t index, Print& log) {
   log.print(F("[tof] "));
   log.print(SIDE_NAMES[index]);
   log.print(F(" VL53L4CD online at 0x"));
-  log.println(SIDE_ADDRESSES[index], HEX);
+  log.print(SIDE_ADDRESSES[index], HEX);
+  log.print(F(" timing_budget_ms="));
+  log.println(sideTimingBudgetMs);
   return true;
 }
 
@@ -181,6 +193,11 @@ void TofSensors::poll(uint32_t nowMs) {
     if (sample.i2cStatus == 0U && !sensor.timeoutOccurred()) {
       sample.rangeMm = range;
       sample.rangeStatus = sensor.ranging_data.range_status;
+      sample.signalRateKcps = sensor.ranging_data.signal_rate_kcps;
+      sample.ambientRateKcps = sensor.ranging_data.ambient_rate_kcps;
+      sample.sigmaMm = sensor.ranging_data.sigma_mm;
+      sample.spadCount = sensor.ranging_data.number_of_spad;
+      sample.qualityAvailable = true;
       sample.valid = range != 0U && sample.rangeStatus == 0U &&
                      sensor.ranging_data.number_of_spad != 0U;
       sample.lastUpdateMs = nowMs;
@@ -233,7 +250,18 @@ void TofSensors::printOne(Print& log, const __FlashStringHelper* name,
   log.print(F(" n="));
   log.print(sample.sampleCount);
   log.print(F(" bus_errors="));
-  log.println(sample.busErrorCount);
+  log.print(sample.busErrorCount);
+  if (sample.qualityAvailable) {
+    log.print(F(" signal_kcps="));
+    log.print(sample.signalRateKcps);
+    log.print(F(" ambient_kcps="));
+    log.print(sample.ambientRateKcps);
+    log.print(F(" sigma_mm="));
+    log.print(sample.sigmaMm);
+    log.print(F(" spads="));
+    log.print(sample.spadCount);
+  }
+  log.println();
 }
 
 void TofSensors::printSummary(Print& log, uint32_t nowMs) const {

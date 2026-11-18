@@ -29,3 +29,31 @@ local-config.*
 
 # Private field logs, firmware snapshots, experiments and backups
 /local/
+# --- added by migration 2026-11-18 ---
+node_modules/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+.env
+.env.*
+!.env*.example
+!.env*.sample
+!.env*.template
+._*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa*
+id_ed25519*
+*service-account*.json
+.gradle/
+DerivedData/
+.next/
+# nested repos / worktrees (handled separately)
+# files over 50 MB (kept on SSD only)
+/models/Ackermann Chassis CLEAN Named Assembly.f3z

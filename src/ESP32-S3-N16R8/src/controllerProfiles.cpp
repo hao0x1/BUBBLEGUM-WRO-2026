@@ -5,7 +5,11 @@ namespace autonomy {
 const char* controllerSourceIdentity(ChallengeProfile profile) {
   return profile == ChallengeProfile::Obstacle
              ? "BUBBLEGUM AUTONOMOUS OBSTACLE 20260905-R42 FULL COURSE - PARKING DISABLED"
-             : "BUBBLEGUM AUTONOMOUS OPEN 20260905-R18 - MOTION CAPABLE";
+             : "BUBBLEGUM AUTONOMOUS OPEN 20260905-R20 FIELD RECOVERY - MOTION CAPABLE";
+}
+
+const char* openFallbackSourceIdentity() {
+  return "BUBBLEGUM AUTONOMOUS OPEN 20260905-R21 OPTICAL FALLBACK - MOTION CAPABLE";
 }
 
 Config makeControllerConfig(ChallengeProfile profile) {
@@ -53,6 +57,7 @@ Config makeControllerConfig(ChallengeProfile profile) {
   config.minimumRunImuAccuracy = 1;
 
   const bool obstacle = profile == ChallengeProfile::Obstacle;
+  config.firstDirectionApproachHoldEnabled = !obstacle;
   config.obstacleAvoidanceEnabled = obstacle;
   config.requireVisionForMotion = obstacle;
   config.acceptFrontWrapTargetRange = !obstacle;
@@ -220,6 +225,60 @@ Config makeGuardedObstacleConfig() {
   config.obstacleSinglePassBodyClearMs = 500;
   config.parkingEnabled = false;
   return config;
+}
+
+Config makeOpenFallbackConfig() {
+  Config config = makeControllerConfig(ChallengeProfile::Open);
+  config.openOpticalRecoveryEnabled = true;
+  return config;
+}
+
+Config makeObstacleFallbackConfig(bool progressPriority) {
+  Config config = makeGuardedObstacleConfig();
+  config.obstacleRecoveryPolicy = progressPriority ? 2U : 1U;
+  config.requireVisionForMotion = !progressPriority;
+  return config;
+}
+
+const char* obstacleFallbackSourceIdentity(bool progressPriority) {
+  return progressPriority
+      ? "BUBBLEGUM AUTONOMOUS OBSTACLE 20260905-R44 PROGRESS PRIORITY - PARKING DISABLED"
+      : "BUBBLEGUM AUTONOMOUS OBSTACLE 20260905-R43 RECOVERABLE - PARKING DISABLED";
+}
+
+Config makeObstacleContinueConfig(CourseDirection direction) {
+  Config config = makeGuardedObstacleConfig();
+  config.obstacleRecoveryPolicy = 3U;
+  config.obstacleFallbackDirection = direction;
+  config.requireVisionForMotion = false;
+
+  // The field walls repeatedly produced fresh VL53 status 2 rather than a
+  // numeric side range. Keep camera avoidance when it is present, but let the
+  // IMU and centre-front sensor carry the square course when every side ray
+  // reports optical open space.
+  config.straightFrontOpticalGraceMs = config.maxRunMs;
+  config.cornerFrontOpticalGraceMs = config.maxRunMs;
+  config.straightSideGeometryGraceMs = config.maxRunMs;
+  config.cornerSideGeometryGraceMs = config.maxRunMs;
+
+  // Release a disappeared pillar promptly without waiting for an unavailable
+  // front/back side-pair transition. A measured close centre-front result is
+  // still handled by the bounded reverse recovery.
+  config.obstaclePreCloseLossClearMs = 250U;
+  config.obstacleMaximumCommitMs = 3000U;
+  config.obstacleSinglePassBodyClearMs = 0U;
+  config.obstacleBodyClearFrontGuardMm = 0U;
+  config.obstacleBodyClearOppositeSideGuardMm = 0U;
+  config.recoverCenteredEscapeBeforePass = false;
+  config.visionUncertainSpeedPermille = 300U;
+  config.visionOverrunSpeedPermille = 300U;
+  return config;
+}
+
+const char* obstacleContinueSourceIdentity(CourseDirection direction) {
+  return direction == CourseDirection::CounterClockwise
+      ? "BUBBLEGUM AUTONOMOUS OBSTACLE 20260905-R45 CONTINUE CCW - PARKING DISABLED"
+      : "BUBBLEGUM AUTONOMOUS OBSTACLE 20260905-R45 CONTINUE CW - PARKING DISABLED";
 }
 
 }  // namespace autonomy
